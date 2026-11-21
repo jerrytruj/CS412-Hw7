@@ -1,0 +1,436 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+  <meta charset="utf-8">
+  <title>Ray Tracing</title>
+  <style>
+    body { background: #111; color: #ccc; font-family: monospace; }
+    canvas { border: 1px solid #444; touch-action: none; }
+    .layout { display: flex; gap: 10px; align-items: flex-start; }
+    .editors { display: flex; flex-direction: column; gap: 10px; }
+    textarea {
+      background: #222;
+      color: #0f0;
+      font: 14px monospace;
+      width: 400px;
+      height: 200px;
+      box-sizing: border-box;
+      white-space: pre;
+    }
+    #shaderError { color: #f66; white-space: pre-wrap; width: 400px; margin: 0; }
+    .controls { margin-top: 10px; display: flex; flex-direction: column; gap: 5px; }
+    .control-row { display: flex; align-items: center; gap: 10px; }
+  </style>
+</head>
+
+<body>
+  <h2>HW 7 Ray Tracing: Sunken Treasure</h2>
+
+  <p>Edit the shaders on the left; the canvas updates as you type.<br>
+    Drag with the mouse to orbit the camera around the scene.<br>
+    Use the sliders to change the bounces, ambient light, bubble glass, and shininess.</p>
+
+  <div class="layout">
+    <div class="editors">
+      <div>
+        <b>Vertex Shader</b><br>
+        <textarea id="vertEditor" spellcheck="false"></textarea>
+      </div>
+      <div>
+        <b>Fragment Shader</b><br>
+        <textarea id="fragEditor" spellcheck="false"></textarea>
+      </div>
+      <pre id="shaderError"></pre>
+    </div>
+
+    <div>
+      <canvas id="glcanvas" width="640" height="400"></canvas>
+
+      <div class="controls">
+        <div class="control-row">
+          <label for="bounces">Max Bounces:</label>
+          <input type="range" id="bounces" min="1" max="8" value="6">
+          <span id="bouncesValue">6</span>
+        </div>
+        <div class="control-row">
+          <label for="ambient">Ambient Strength:</label>
+          <input type="range" id="ambient" min="0" max="1" step="0.05" value="0.1">
+          <span id="ambientValue">0.1</span>
+        </div>
+        <div class="control-row">
+          <label for="ior">Bubble Glass:</label>
+          <input type="range" id="ior" min="1.0" max="2.4" step="0.01" value="1.5">
+          <span id="iorValue">1.5</span>
+        </div>
+        <div class="control-row">
+          <label for="shininess">Shininess:</label>
+          <input type="range" id="shininess" min="2" max="128" step="1" value="40">
+          <span id="shininessValue">40</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+<script id="vertex-shader" type="x-shader/x-vertex">#version 300 es
+in vec2 position;
+void main() {
+    gl_Position = vec4(position, 0.0, 1.0);
+}
+</script>
+
+<script id="fragment-shader" type="x-shader/x-fragment">#version 300 es
+precision highp float;
+
+uniform float u_time;
+uniform vec2 u_resolution;
+uniform int u_maxBounces;
+uniform float u_ambientStrength; //Ambient fill light for better visual
+uniform vec2 u_cameraOrbit;
+uniform float u_ior;        // bubble glass refractive index (new slider)
+uniform float u_shininess;  // Phong specular exponent (new slider)
+
+out vec4 fragColor;
+
+const float LIGHT_POWER = 4.0;
+const float FLOOR_Y = -2.0;
+const float CHECKER_SIZE = 3.0;
+const int NUM_BUBBLES = 3;
+
+struct Ray {
+    vec3 origin;
+    vec3 direction;
+};
+
+struct Sphere {
+    vec3 center;
+    float radius;
+    vec3 color;
+};
+
+// Like the starter's Cube, but halfSize is a vec3 so the box can be wider than it is tall
+struct Box {
+    vec3 center;
+    vec3 halfSize;
+    vec3 color;
+    float reflectivity;
+};
+
+struct HitData {
+    bool hit;
+    float t;
+    vec3 point;
+    vec3 normal;
+    vec3 color;
+    float reflectivity;
+    bool isLight;
+    bool isGlass;
+};
+
+// Two lights: a warm one on the left and a cyan one on the right
+Sphere lights[2];
+Box chestBody;
+Box chestLid;
+Sphere pearl;
+Sphere bubbles[NUM_BUBBLES];
+
+// Places everything in the scene
+void initScene(float time) {
+    lights[0] = Sphere(vec3(-2.3, 0.7, -5.0), 0.2, vec3(1.0, 0.85, 0.65));
+    lights[1] = Sphere(vec3(2.4, 0.5, -5.6), 0.2, vec3(0.3, 0.9, 1.0));
+
+    // Treasure chest: wooden body (diffuse) with a gold lid (reflective)
+    chestBody = Box(vec3(0.0, -1.38, -6.0), vec3(1.1, 0.62, 0.7), vec3(0.22, 0.10, 0.04), 0.0);
+    chestLid = Box(vec3(0.0, -0.58, -6.0), vec3(1.16, 0.2, 0.76), vec3(1.0, 0.62, 0.18), 0.75);
+
+    // Pearl resting on the floor (radius 0.45, so its center is 0.45 above the floor)
+    pearl = Sphere(vec3(1.9, FLOOR_Y + 0.45, -4.6), 0.45, vec3(0.92, 0.88, 0.86));
+
+    // Glass bubbles floating above the chest
+    vec3 glass = vec3(0.92, 0.97, 1.0);
+    bubbles[0] = Sphere(vec3(-0.5, 0.0, -5.7), 0.3, glass);
+    bubbles[1] = Sphere(vec3(0.5, 0.35, -5.9), 0.25, glass);
+    bubbles[2] = Sphere(vec3(-0.05, 0.75, -6.0), 0.33, glass);
+}
+
+bool intersectSphere(Ray ray, Sphere s, out float t) {
+    vec3 oc = ray.origin - s.center;
+    float b = dot(oc, ray.direction);
+    // Same as b*b - dot(oc, oc) + r*r, but measured as "how far the ray passes from the center",
+    // which stays accurate for small spheres far from the camera (like the bubbles)
+    vec3 perp = oc - b * ray.direction;
+    float d = s.radius * s.radius - dot(perp, perp);
+    if (d < 0.0) return false;
+
+    t = -b - sqrt(d);
+    if (t < 0.001) t = -b + sqrt(d);  // ray starts inside
+    return t > 0.001;
+}
+
+// Slab test, same as the starter's cube but with a different half size per axis
+bool intersectBox(Ray ray, Box box, out float t, out vec3 normal) {
+    vec3 t0s = (box.center - box.halfSize - ray.origin) / ray.direction;
+    vec3 t1s = (box.center + box.halfSize - ray.origin) / ray.direction;
+    vec3 tmin = min(t0s, t1s);
+    vec3 tmax = max(t0s, t1s);
+    float t0 = max(max(tmin.x, tmin.y), tmin.z);
+    float t1 = min(min(tmax.x, tmax.y), tmax.z);
+    if (t1 < 0.0 || t0 > t1) return false;
+
+    t = t0 > 0.001 ? t0 : t1;
+    if (t < 0.001) return false;
+
+    // Which face was hit: divide by the half size so every axis is measured on the same -1..1 scale
+    vec3 local = (ray.origin + ray.direction * t - box.center) / box.halfSize;
+    vec3 a = abs(local);
+    if (a.x > a.y && a.x > a.z) normal = vec3(sign(local.x), 0.0, 0.0);
+    else if (a.y > a.z) normal = vec3(0.0, sign(local.y), 0.0);
+    else normal = vec3(0.0, 0.0, sign(local.z));
+    return true;
+}
+
+//eta = n1 / n2
+// Bends the ray as it crosses into a new material (Snell's law). Returns (0,0,0) if it can't get out.
+vec3 refraction(vec3 I, vec3 N, float eta) {
+    float cosi = -dot(N, I);                          // cos of the angle between the ray and the normal
+    // From Snell's law: k = 1 - sin²(bent angle). If it's negative, the ray can't escape
+    // and bounces back inside instead (total internal reflection).
+    float k = 1.0 - eta * eta * (1.0 - cosi * cosi);
+    if (k < 0.0) return vec3(0.0);
+    return eta * I + (eta * cosi - sqrt(k)) * N;      // the bent direction
+}
+
+// Schlick approximation
+// How much light reflects off glass instead of passing through, based on the viewing angle
+float schlick(float cosine, float ref_idx) {
+    float r0 = (1.0 - ref_idx) / (1.0 + ref_idx);
+    r0 = r0 * r0;                                     // reflection when looking straight on (about 4% for glass)
+    return r0 + (1.0 - r0) * pow(1.0 - cosine, 5.0);  // climbs to 100% at grazing angles
+}
+
+bool intersectFloor(Ray ray, out float t) {
+    if (abs(ray.direction.y) < 0.0001) return false;
+    t = (FLOOR_Y - ray.origin.y) / ray.direction.y;
+    return t > 0.001;
+}
+
+// Finds the closest thing the ray hits
+HitData traceScene(Ray ray, bool includeLight) {
+    HitData hit;
+    hit.hit = false;
+    hit.t = 1e10;
+    float t;
+    vec3 n;
+
+    for (int i = 0; i < 2; i++) {
+        Sphere light = lights[i];
+        if (includeLight && intersectSphere(ray, light, t) && t < hit.t) {
+            hit = HitData(true, t, ray.origin + ray.direction * t, vec3(0.0), light.color, 0.0, true, false);
+        }
+    }
+
+    if (intersectFloor(ray, t) && t < hit.t) {
+        vec3 p = ray.origin + ray.direction * t;
+        vec2 cell = floor(p.xz / CHECKER_SIZE);
+        vec3 color = mod(cell.x + cell.y, 2.0) < 1.0 ? vec3(1.0) : vec3(0.05);
+        hit = HitData(true, t, p, vec3(0.0, 1.0, 0.0), color, 0.0, false, false);
+    }
+
+    if (intersectBox(ray, chestBody, t, n) && t < hit.t) {
+        hit = HitData(true, t, ray.origin + ray.direction * t, n, chestBody.color, chestBody.reflectivity, false, false);
+    }
+
+    if (intersectBox(ray, chestLid, t, n) && t < hit.t) {
+        hit = HitData(true, t, ray.origin + ray.direction * t, n, chestLid.color, chestLid.reflectivity, false, false);
+    }
+
+    if (intersectSphere(ray, pearl, t) && t < hit.t) {
+        vec3 p = ray.origin + ray.direction * t;
+        hit = HitData(true, t, p, (p - pearl.center) / pearl.radius, pearl.color, 0.3, false, false);
+    }
+
+    for (int i = 0; i < NUM_BUBBLES; i++) {
+        Sphere bubble = bubbles[i];
+        if (intersectSphere(ray, bubble, t) && t < hit.t) {
+            vec3 p = ray.origin + ray.direction * t;
+            hit = HitData(true, t, p, (p - bubble.center) / bubble.radius, bubble.color, 0.0, false, true);
+        }
+    }
+
+    return hit;
+}
+
+vec3 trace(Ray ray) {
+    vec3 color = vec3(0.0);
+    vec3 attenuation = vec3(1.0);
+
+    //use loop to simulate the recursive process as GLSL doesn't support recursions
+    for (int bounce = 0; bounce < u_maxBounces; bounce++) {
+        HitData hit = traceScene(ray, true);
+
+        if (!hit.hit) {
+            float t = 0.5 * (ray.direction.y + 1.0);
+            color += attenuation * mix(vec3(0.09, 0.12, 0.18), vec3(0.18, 0.21, 0.27), t);  // sky
+            break;
+        }
+
+        if (hit.isLight) {
+            color += attenuation * hit.color * 1.5;   // draw the light in its own color
+            break;
+        }
+
+        // Refraction (option 1): either reflects or refracts the ray, whichever Schlick says is stronger
+        if (hit.isGlass) {
+            // Entering the bubble: the normal faces the ray. Leaving it: flip the normal and the ratio.
+            bool entering = dot(ray.direction, hit.normal) < 0.0;
+            vec3 n = entering ? hit.normal : -hit.normal;
+            float eta = entering ? 1.0 / u_ior : u_ior;      // eta = n1 / n2
+            float cosine = min(dot(-ray.direction, n), 1.0);
+
+            vec3 refracted = refraction(ray.direction, n, eta);
+            bool totalInternalReflection = dot(refracted, refracted) == 0.0;
+
+            vec3 direction;
+            if (totalInternalReflection || schlick(cosine, eta) > 0.5) {
+                direction = reflect(ray.direction, n);       // reflection ray
+            } else {
+                direction = refracted;                       // refraction ray
+            }
+
+            ray = Ray(hit.point + direction * 0.001, direction);
+            attenuation *= hit.color;                         // slight blue tint each time it passes through glass
+            continue;
+        }
+
+        // Local Phong lighting: ambient + (diffuse + specular) from each light, with shadows
+        vec3 shading = hit.color * u_ambientStrength;
+        for (int i = 0; i < 2; i++) {
+            vec3 toLight = lights[i].center - hit.point;
+            float lightDist = length(toLight);
+            vec3 lightDir = toLight / lightDist;
+
+            // Shadow: anything between this point and the light blocks it (same test as the starter)
+            HitData blocker = traceScene(Ray(hit.point + hit.normal * 0.001, lightDir), false);
+            float visible = blocker.hit && blocker.t < lightDist ? 0.0 : 1.0;
+
+            float diff = max(dot(hit.normal, lightDir), 0.0);
+            vec3 R = reflect(-lightDir, hit.normal);                          // light bouncing off the surface
+            float spec = pow(max(dot(R, -ray.direction), 0.0), u_shininess);  // bright when the bounce hits the camera
+            float falloff = 1.0 / (1.0 + 0.1 * lightDist * lightDist);
+
+            shading += lights[i].color * LIGHT_POWER * falloff * visible * (hit.color * diff + spec * 0.5);
+        }
+        color += attenuation * shading * (1.0 - hit.reflectivity);
+
+        if (hit.reflectivity == 0.0) break;
+        attenuation *= hit.reflectivity * hit.color;   // tint the reflection with the surface color (gold looks gold)
+        ray = Ray(hit.point + hit.normal * 0.001, reflect(ray.direction, hit.normal));
+    }
+
+    return color;
+}
+
+void main() {
+    initScene(u_time);
+
+    // Orbit camera around the scene center
+    float cp = cos(u_cameraOrbit.x), sp = sin(u_cameraOrbit.x);
+    float cy = cos(u_cameraOrbit.y), sy = sin(u_cameraOrbit.y);
+    mat3 rotX = mat3(1.0, 0.0, 0.0,  0.0, cp, -sp,  0.0, sp, cp);
+    mat3 rotY = mat3(cy, 0.0, -sy,  0.0, 1.0, 0.0,  sy, 0.0, cy);
+    mat3 camera = rotY * rotX;
+
+    vec3 target = vec3(0.0, -0.8, -6.0);
+    vec2 uv = (gl_FragCoord.xy - 0.5 * u_resolution) / u_resolution.y;
+    Ray ray = Ray(target + camera * vec3(0.0, 0.0, 7.0), camera * normalize(vec3(uv, -1.5)));
+
+    fragColor = vec4(pow(trace(ray), vec3(1.0 / 2.2)), 1.0);  // gamma correction
+}
+</script>
+
+<script>
+  const canvas = document.getElementById("glcanvas");
+  const gl = canvas.getContext("webgl2");
+
+  function compile(type, source) {
+    const shader = gl.createShader(type);
+    gl.shaderSource(shader, source);
+    gl.compileShader(shader);
+    if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(shader));
+    return shader;
+  }
+
+  function createProgram(vsSource, fsSource) {
+    const prog = gl.createProgram();
+    gl.attachShader(prog, compile(gl.VERTEX_SHADER, vsSource));
+    gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, fsSource));
+    gl.bindAttribLocation(prog, 0, "position");
+    gl.linkProgram(prog);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+    return prog;
+  }
+
+  const vertEditor = document.getElementById("vertEditor");
+  const fragEditor = document.getElementById("fragEditor");
+  const shaderError = document.getElementById("shaderError");
+  vertEditor.value = document.getElementById("vertex-shader").textContent;
+  fragEditor.value = document.getElementById("fragment-shader").textContent;
+
+  let program;
+  function updateProgram() {
+    try {
+      const prog = createProgram(vertEditor.value, fragEditor.value);
+      gl.deleteProgram(program);
+      program = prog;
+      gl.useProgram(program);
+      shaderError.textContent = "";
+    } catch (e) {
+      shaderError.textContent = e.message.replace(/\0/g, "");
+    }
+  }
+  updateProgram();
+  vertEditor.addEventListener("input", updateProgram);
+  fragEditor.addEventListener("input", updateProgram);
+
+  gl.bindVertexArray(gl.createVertexArray());
+  gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+  gl.enableVertexAttribArray(0);
+
+  const bounces = document.getElementById("bounces");
+  const ambient = document.getElementById("ambient");
+  const ior = document.getElementById("ior");
+  const shininess = document.getElementById("shininess");
+  for (const slider of [bounces, ambient, ior, shininess]) {
+    slider.addEventListener("input", () => document.getElementById(slider.id + "Value").textContent = slider.value);
+  }
+
+  // Dragging orbits the camera
+  let pitch = 0.25, yaw = 0;
+  canvas.addEventListener("pointerdown", e => canvas.setPointerCapture(e.pointerId));
+  canvas.addEventListener("pointermove", e => {
+    if (!canvas.hasPointerCapture(e.pointerId)) return;
+    yaw -= e.movementX * 0.01;
+    pitch = Math.min(1.4, Math.max(-0.2, pitch + e.movementY * 0.01));
+  });
+
+  function render(time) {
+    requestAnimationFrame(render);
+    if (!program) return;
+
+    const uniform = name => gl.getUniformLocation(program, name);
+    gl.uniform1f(uniform("u_time"), time / 1000);
+    gl.uniform2f(uniform("u_resolution"), canvas.width, canvas.height);
+    gl.uniform1i(uniform("u_maxBounces"), bounces.value);
+    gl.uniform1f(uniform("u_ambientStrength"), ambient.value);
+    gl.uniform2f(uniform("u_cameraOrbit"), pitch, yaw);
+    gl.uniform1f(uniform("u_ior"), ior.value);
+    gl.uniform1f(uniform("u_shininess"), shininess.value);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  }
+  requestAnimationFrame(render);
+</script>
+</body>
+
+</html>
